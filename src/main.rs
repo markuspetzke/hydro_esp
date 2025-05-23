@@ -1,6 +1,7 @@
 use anyhow::Result;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
+use serde_json::json;
 use std::{thread::sleep, time::Duration};
 
 use embedded_svc::http::client::Client;
@@ -9,8 +10,6 @@ use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_idf_svc::hal::adc::{AdcContConfig, AdcContDriver, AdcMeasurement, Attenuated};
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("SSID_PASSWORD");
 const CALIBRATION: f32 = 20.70;
 
 fn main() -> Result<()> {
@@ -29,8 +28,8 @@ fn main() -> Result<()> {
     let mut wifi_driver = EspWifi::new(modem, sys_loop, Some(nvs)).unwrap();
 
     let ap_config = Configuration::Client(ClientConfiguration {
-        ssid: SSID.try_into().unwrap(),
-        password: PASSWORD.try_into().unwrap(),
+        ssid: env!("SSID").try_into().unwrap(),
+        password: env!("SSID_PASSWORD").try_into().unwrap(),
         ..Default::default()
     });
 
@@ -46,7 +45,6 @@ fn main() -> Result<()> {
     let adc_pin = Attenuated::db11(pins.gpio34);
     let mut adc = AdcContDriver::new(adc1, i2s0, &AdcContConfig::default(), adc_pin)?;
 
-    let url = env!("URL");
     adc.start()?;
     loop {
         let ph = {
@@ -67,14 +65,14 @@ fn main() -> Result<()> {
         };
 
         let httpconnection = EspHttpConnection::new(&HttpConfig::default())?;
-        let body = format!("ph_value={}", ph);
+        let body = json!({"ph_value": ph, "sensor_id": env!("ID")}).to_string();
         let headers = &[
-            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Content-Type", "application/json"),
             ("Content-Length", &body.len().to_string()),
         ];
 
         let mut httpclient = Client::wrap(httpconnection);
-        let mut request = httpclient.post(url, headers)?;
+        let mut request = httpclient.post(env!("URL"), headers)?;
         request.write_all(body.as_bytes())?;
         request.submit()?;
 
