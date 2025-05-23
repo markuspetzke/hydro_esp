@@ -9,8 +9,8 @@ use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_idf_svc::hal::adc::{AdcContConfig, AdcContDriver, AdcMeasurement, Attenuated};
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 
-const SSID: &str = "SSID";
-const PASSWORD: &str = "Password";
+const SSID: &str = env!("SSID");
+const PASSWORD: &str = env!("SSID_PASSWORD");
 const CALIBRATION: f32 = 20.70;
 
 fn main() -> Result<()> {
@@ -46,8 +46,7 @@ fn main() -> Result<()> {
     let adc_pin = Attenuated::db11(pins.gpio34);
     let mut adc = AdcContDriver::new(adc1, i2s0, &AdcContConfig::default(), adc_pin)?;
 
-    let url = "http://192.168.0.100:80/api/add_ph.php";
-
+    let url = env!("URL");
     adc.start()?;
     loop {
         let ph = {

@@ -34,3 +34,4 @@ embedded-hal = "1.0.0"
 
 [build-dependencies]
 embuild = "0.33"
+dotenv-build = "0.1.1"
