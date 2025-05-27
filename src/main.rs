@@ -76,6 +76,6 @@ fn main() -> Result<()> {
         request.write_all(body.as_bytes())?;
         request.submit()?;
 
-        sleep(Duration::new(10, 0));
+        sleep(Duration::new(120, 0));
     }
 }
