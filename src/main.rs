@@ -1,7 +1,6 @@
 use anyhow::Result;
 use esp_idf_hal::adc::oneshot::AdcDriver;
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
 use serde_json::json;
 use std::{thread::sleep, time::Duration};
@@ -13,30 +12,29 @@ use esp_idf_hal::adc::attenuation::DB_11;
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::adc::oneshot::*;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
-use log::info;
 const PH_SLOPE: f32 = -5.7;
 const ADC_REF_VOLTAGE: f32 = 3.3;
 const CALIBRATION: f32 = 21.00;
 
 fn main() -> Result<()> {
-    EspLogger::initialize_default();
     esp_idf_svc::sys::link_patches();
 
     let Peripherals {
         pins, modem, adc1, ..
     } = Peripherals::take().unwrap();
 
-    let sys_loop = EspSystemEventLoop::take().unwrap();
-    let nvs = EspDefaultNvsPartition::take().unwrap();
-
-    let mut wifi_driver = EspWifi::new(modem, sys_loop, Some(nvs)).unwrap();
+    let mut wifi_driver = EspWifi::new(
+        modem,
+        EspSystemEventLoop::take().unwrap(),
+        Some(EspDefaultNvsPartition::take().unwrap()),
+    )
+    .unwrap();
 
     let ap_config = Configuration::Client(ClientConfiguration {
         ssid: env!("SSID").try_into().unwrap(),
         password: env!("SSID_PASSWORD").try_into().unwrap(),
         ..Default::default()
     });
-    info!("WIFI connected");
 
     wifi_driver.set_configuration(&ap_config).unwrap();
     wifi_driver.start().unwrap();
@@ -67,9 +65,7 @@ fn main() -> Result<()> {
 
         let ph = CALIBRATION + PH_SLOPE * voltage;
 
-        info!("ADC: {} -> {:.3} V -> pH = {:.2}", avg, voltage, ph);
-
-        if (0.0..=14.0).contains(&ph) {
+        if (2.0..=14.0).contains(&ph) {
             let httpconnection = EspHttpConnection::new(&HttpConfig::default())?;
             let body =
                 json!({    "ph_value": format!("{:.3}", ph), "sensor_id": env!("ID")}).to_string();
