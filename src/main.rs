@@ -98,9 +98,9 @@ fn main() -> Result<()> {
                         false => {
                             println!("Nacht");
                             led.set_high().unwrap();
-                            thread::sleep(Duration::new(val.day_pump, 0));
+                            thread::sleep(Duration::new(val.night_pump, 0));
                             led.set_low().unwrap();
-                            thread::sleep(Duration::new(val.day_break, 0));
+                            thread::sleep(Duration::new(val.night_break, 0));
                         }
                     }
                     thread::sleep(Duration::new(30, 0));
