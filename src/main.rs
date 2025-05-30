@@ -1,20 +1,20 @@
 use anyhow::Result;
-use esp_idf_hal::adc::oneshot::AdcDriver;
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
-use serde::Deserialize;
-use serde_json::json;
-use std::ptr::null;
-use std::sync::{Arc, Mutex};
-use std::{thread, thread::sleep, time::Duration};
-
+use chrono::NaiveTime;
 use embedded_svc::http::client::Client;
 use embedded_svc::io::Write;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_idf_hal::adc::attenuation::DB_11;
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
+use esp_idf_hal::adc::oneshot::AdcDriver;
 use esp_idf_hal::adc::oneshot::*;
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
+use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+use std::{thread, thread::sleep, time::Duration};
 const PH_SLOPE: f32 = -5.7;
 const ADC_REF_VOLTAGE: f32 = 3.3;
 const CALIBRATION: f32 = 21.00;
@@ -27,6 +27,9 @@ struct Settings {
     night_pump: i32,
     night_break: i32,
     mess_interval: u64,
+
+    night_start: NaiveTime,
+    day_start: NaiveTime,
 }
 
 fn main() -> Result<()> {
@@ -58,6 +61,17 @@ fn main() -> Result<()> {
         sleep(Duration::new(10, 0));
     }
 
+    //NTP sync
+    std::env::set_var("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3");
+    let sntp = EspSntp::new(&SntpConf {
+        servers: ["europe.pool.ntp.org"],
+        ..Default::default()
+    })?;
+    while sntp.get_sync_status() != SyncStatus::Completed {
+        thread::sleep(Duration::new(2, 0));
+    }
+    println!("Time Sync Completed");
+
     let adc = AdcDriver::new(adc1)?;
     let config = AdcChannelConfig {
         attenuation: DB_11,
@@ -69,8 +83,29 @@ fn main() -> Result<()> {
 
     let settings_clone = Arc::clone(&settings);
 
+    //control pump
     let _ = thread::Builder::new()
-        .stack_size(64 * 1024)
+        .stack_size(12 * 1024)
+        .spawn(move || loop {
+            if let Ok(locked) = settings_clone.lock() {
+                if let Some(val) = &*locked {
+                    let now = chrono::Local::now().time();
+                    match val.day_start <= now && now < val.night_start {
+                        true => println!("Es ist Tag"),
+                        false => println!("Es ist Nacht"),
+                    }
+                    thread::sleep(Duration::new(30, 0));
+                } else {
+                    thread::sleep(Duration::new(30, 0));
+                }
+            } else {
+                eprintln!("Fehler beim Locken des Mutex");
+            }
+        });
+    //Fetch settings
+    let settings_clone = Arc::clone(&settings);
+    let _ = thread::Builder::new()
+        .stack_size(4 * 1024)
         .spawn(move || loop {
             match EspHttpConnection::new(&HttpConfig::default()) {
                 Ok(httpconnection) => {
@@ -120,7 +155,7 @@ fn main() -> Result<()> {
                 Err(e) => eprintln!("Fehler beim Aufbau der HTTP-Verbindung: {:?}", e),
             }
 
-            thread::sleep(Duration::from_secs(3));
+            thread::sleep(Duration::from_secs(60 * 10));
         });
 
     loop {
