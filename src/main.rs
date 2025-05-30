@@ -2,7 +2,9 @@ use anyhow::Result;
 use esp_idf_hal::adc::oneshot::AdcDriver;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::EspWifi};
+use serde::Deserialize;
 use serde_json::json;
+use std::ptr::null;
 use std::sync::{Arc, Mutex};
 use std::{thread, thread::sleep, time::Duration};
 
@@ -17,6 +19,15 @@ const PH_SLOPE: f32 = -5.7;
 const ADC_REF_VOLTAGE: f32 = 3.3;
 const CALIBRATION: f32 = 21.00;
 const SERVER: &str = env!("SERVER");
+
+#[derive(Debug, Deserialize)]
+struct Settings {
+    day_pump: i32,
+    day_break: i32,
+    night_pump: i32,
+    night_break: i32,
+    mess_interval: u64,
+}
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -54,47 +65,64 @@ fn main() -> Result<()> {
     };
     let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio34, &config)?;
 
-    let settings: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let settings: Arc<Mutex<Option<Settings>>> = Arc::new(Mutex::new(None));
 
     let settings_clone = Arc::clone(&settings);
 
-    thread::spawn(move || loop {
-        if let Ok(httpconnection) = EspHttpConnection::new(&HttpConfig::default()) {
-            let headers = &[("Content-Type", "application/json")];
+    let _ = thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || loop {
+            match EspHttpConnection::new(&HttpConfig::default()) {
+                Ok(httpconnection) => {
+                    let headers = &[("Content-Type", "application/json")];
+                    let mut httpclient = Client::wrap(httpconnection);
+                    let conc = format!("{SERVER}get_settings.php");
 
-            let mut httpclient = Client::wrap(httpconnection);
-            let conc = format!("{SERVER}get_settings.php");
-            let url: &str = &conc;
-
-            if let Ok(request) = httpclient.post(url, headers) {
-                match request.submit() {
-                    Ok(mut response) => {
-                        let mut body = [0u8; 512];
-                        if let Ok(size) = response.read(&mut body) {
-                            let content = String::from_utf8_lossy(&body[..size]).to_string();
-
-                            // Speicher aktualisieren
-                            if let Ok(mut locked) = settings_clone.lock() {
-                                *locked = Some(content.clone());
-                                println!("Antwort vom Server: {}", content);
+                    match httpclient.post(conc.as_str(), headers) {
+                        Ok(request) => {
+                            match request.submit() {
+                                Ok(mut response) => {
+                                    let mut body = vec![0u8; 512];
+                                    match response.read(&mut body) {
+                                        Ok(size) => {
+                                            let content =
+                                                String::from_utf8_lossy(&body[..size]).to_string();
+                                            match settings_clone.lock() {
+                                                Ok(mut locked) => {
+                                                    match serde_json::from_str::<Settings>(&content)
+                                                    {
+                                                        Ok(parses) => *locked = Some(parses),
+                                                        Err(_) => {
+                                                            eprintln!(
+                                                                "Error beim Parsen der Settings"
+                                                            )
+                                                        }
+                                                    }
+                                                    println!("Antwort vom Server: {}", content);
+                                                }
+                                                Err(poisoned) => {
+                                                    eprintln!("Mutex poisoned: {:?}", poisoned);
+                                                    // Recovery-Möglichkeit hier (z.B. Mutex neu initialisieren)
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Fehler beim Lesen der Antwort: {:?}", e)
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("Fehler beim Senden der Anfrage: {:?}", e),
                             }
-                        } else {
-                            eprintln!("Fehler beim Lesen der Antwort");
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Fehler beim Senden der Anfrage: {:?}", e);
+                        Err(e) => eprintln!("Fehler beim Erstellen der POST-Anfrage: {:?}", e),
                     }
                 }
-            } else {
-                eprintln!("Fehler beim Erstellen der POST-Anfrage");
+                Err(e) => eprintln!("Fehler beim Aufbau der HTTP-Verbindung: {:?}", e),
             }
-        } else {
-            eprintln!("Fehler beim Aufbau der HTTP-Verbindung");
-        }
 
-        thread::sleep(Duration::from_secs(3));
-    });
+            thread::sleep(Duration::from_secs(3));
+        });
+
     loop {
         let mut samples = [0u16; 10];
         for val in &mut samples {
@@ -105,14 +133,6 @@ fn main() -> Result<()> {
         let avg: u32 = samples[2..8].iter().map(|&v| v as u32).sum::<u32>() / 6;
         let corrected = avg as f32 / 0.597; // "simulierte Kalibrierung"
         let voltage: f32 = corrected * ADC_REF_VOLTAGE / 4095.0;
-
-        if let Ok(locked) = settings.lock() {
-            if let Some(val) = &*locked {
-                println!("Gespeicherte Settings: {}", val);
-            } else {
-                println!("Noch keine Settings erhalten");
-            }
-        }
 
         let ph = CALIBRATION + PH_SLOPE * voltage;
 
@@ -127,12 +147,17 @@ fn main() -> Result<()> {
 
             let mut httpclient = Client::wrap(httpconnection);
             let conc = format!("{SERVER}add_ph.php");
-            let url: &str = &conc;
-            let mut request = httpclient.post(url, headers)?;
+            let mut request = httpclient.post(conc.as_str(), headers)?;
             request.write_all(body.as_bytes())?;
             request.submit()?;
         }
 
-        sleep(Duration::new(30, 0));
+        if let Ok(locked) = settings.lock() {
+            if let Some(val) = &*locked {
+                sleep(Duration::new(val.mess_interval, 0));
+            } else {
+                sleep(Duration::new(30, 0));
+            }
+        }
     }
 }
