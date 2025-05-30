@@ -7,6 +7,7 @@ use esp_idf_hal::adc::attenuation::DB_11;
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::adc::oneshot::AdcDriver;
 use esp_idf_hal::adc::oneshot::*;
+use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use esp_idf_svc::sntp::{EspSntp, SntpConf, SyncStatus};
@@ -22,10 +23,10 @@ const SERVER: &str = env!("SERVER");
 
 #[derive(Debug, Deserialize)]
 struct Settings {
-    day_pump: i32,
-    day_break: i32,
-    night_pump: i32,
-    night_break: i32,
+    day_pump: u64,
+    day_break: u64,
+    night_pump: u64,
+    night_break: u64,
     mess_interval: u64,
 
     night_start: NaiveTime,
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
         pins, modem, adc1, ..
     } = Peripherals::take().unwrap();
 
+    //Wifi setup
     let mut wifi_driver = EspWifi::new(
         modem,
         EspSystemEventLoop::take().unwrap(),
@@ -72,17 +74,10 @@ fn main() -> Result<()> {
     }
     println!("Time Sync Completed");
 
-    let adc = AdcDriver::new(adc1)?;
-    let config = AdcChannelConfig {
-        attenuation: DB_11,
-        ..Default::default()
-    };
-    let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio34, &config)?;
-
     let settings: Arc<Mutex<Option<Settings>>> = Arc::new(Mutex::new(None));
-
     let settings_clone = Arc::clone(&settings);
 
+    let mut led = PinDriver::output(pins.gpio27).unwrap();
     //control pump
     let _ = thread::Builder::new()
         .stack_size(12 * 1024)
@@ -91,17 +86,33 @@ fn main() -> Result<()> {
                 if let Some(val) = &*locked {
                     let now = chrono::Local::now().time();
                     match val.day_start <= now && now < val.night_start {
-                        true => println!("Es ist Tag"),
-                        false => println!("Es ist Nacht"),
+                        true => {
+                            println!("Tag");
+                            println!("Pumpe an");
+                            led.set_high().unwrap();
+                            thread::sleep(Duration::new(val.day_pump, 0));
+                            println!("Pumpe aus");
+                            led.set_low().unwrap();
+                            thread::sleep(Duration::new(val.day_break, 0));
+                        }
+                        false => {
+                            println!("Nacht");
+                            led.set_high().unwrap();
+                            thread::sleep(Duration::new(val.day_pump, 0));
+                            led.set_low().unwrap();
+                            thread::sleep(Duration::new(val.day_break, 0));
+                        }
                     }
                     thread::sleep(Duration::new(30, 0));
                 } else {
+                    println!("Locked wrong");
                     thread::sleep(Duration::new(30, 0));
                 }
             } else {
                 eprintln!("Fehler beim Locken des Mutex");
             }
         });
+
     //Fetch settings
     let settings_clone = Arc::clone(&settings);
     let _ = thread::Builder::new()
@@ -157,6 +168,13 @@ fn main() -> Result<()> {
 
             thread::sleep(Duration::from_secs(60 * 10));
         });
+
+    let adc = AdcDriver::new(adc1)?;
+    let config = AdcChannelConfig {
+        attenuation: DB_11,
+        ..Default::default()
+    };
+    let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio34, &config)?;
 
     loop {
         let mut samples = [0u16; 10];
