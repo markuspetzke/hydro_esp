@@ -21,7 +21,7 @@ const ADC_REF_VOLTAGE: f32 = 3.3;
 const CALIBRATION: f32 = 21.00;
 const SERVER: &str = env!("SERVER");
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Settings {
     day_pump: u64,
     day_break: u64,
@@ -36,9 +36,11 @@ struct Settings {
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
 
-    let Peripherals {
-        pins, modem, adc1, ..
-    } = Peripherals::take().unwrap();
+    let peripherals = Peripherals::take().unwrap();
+    let modem = peripherals.modem;
+    let adc1 = peripherals.adc1;
+    let gpio34 = peripherals.pins.gpio34;
+    let gpio27 = peripherals.pins.gpio27;
 
     //Wifi setup
     let mut wifi_driver = EspWifi::new(
@@ -77,43 +79,48 @@ fn main() -> Result<()> {
     let settings: Arc<Mutex<Option<Settings>>> = Arc::new(Mutex::new(None));
     let settings_clone = Arc::clone(&settings);
 
-    let mut led = PinDriver::output(pins.gpio27).unwrap();
+    let led = Arc::new(Mutex::new(PinDriver::output(gpio27)?));
+    let led_clone = Arc::clone(&led);
     //control pump
     let _ = thread::Builder::new()
         .stack_size(12 * 1024)
         .spawn(move || loop {
             if let Ok(locked) = settings_clone.lock() {
-                if let Some(val) = &*locked {
+                if let Some(val) = (*locked).clone() {
+                    drop(locked);
                     let now = chrono::Local::now().time();
-                    match val.day_start <= now && now < val.night_start {
-                        true => {
-                            println!("Tag");
-                            println!("Pumpe an");
-                            led.set_high().unwrap();
-                            thread::sleep(Duration::new(val.day_pump, 0));
-                            println!("Pumpe aus");
-                            led.set_low().unwrap();
-                            thread::sleep(Duration::new(val.day_break, 0));
-                        }
-                        false => {
-                            println!("Nacht");
-                            led.set_high().unwrap();
-                            thread::sleep(Duration::new(val.night_pump, 0));
-                            led.set_low().unwrap();
-                            thread::sleep(Duration::new(val.night_break, 0));
-                        }
+
+                    let mut led = led_clone.lock().unwrap();
+                    if val.day_start <= now && now < val.night_start {
+                        println!("Tagbetrieb");
+
+                        println!("Pumpe an");
+                        led.set_high().unwrap();
+                        thread::sleep(Duration::from_secs(val.day_pump));
+
+                        println!("Pumpe aus");
+                        led.set_low().unwrap();
+                        thread::sleep(Duration::from_secs(val.day_break));
+                    } else {
+                        println!("Nachtbetrieb");
+
+                        println!("Pumpe an");
+                        led.set_high().unwrap();
+                        thread::sleep(Duration::from_secs(val.night_pump));
+
+                        println!("Pumpe aus");
+                        led.set_low().unwrap();
+                        thread::sleep(Duration::from_secs(val.night_break));
                     }
-                    thread::sleep(Duration::new(30, 0));
                 } else {
-                    println!("Locked wrong");
-                    thread::sleep(Duration::new(30, 0));
+                    println!("Settings sind noch nicht gesetzt");
+                    thread::sleep(Duration::from_secs(30));
                 }
             } else {
                 eprintln!("Fehler beim Locken des Mutex");
+                thread::sleep(Duration::from_secs(30));
             }
-        });
-
-    //Fetch settings
+        }); // //Fetch settings
     let settings_clone = Arc::clone(&settings);
     let _ = thread::Builder::new()
         .stack_size(4 * 1024)
@@ -169,48 +176,92 @@ fn main() -> Result<()> {
             thread::sleep(Duration::from_secs(60 * 10));
         });
 
-    let adc = AdcDriver::new(adc1)?;
-    let config = AdcChannelConfig {
-        attenuation: DB_11,
-        ..Default::default()
-    };
-    let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio34, &config)?;
+    let settings_clone = Arc::clone(&settings);
 
-    loop {
-        let mut samples = [0u16; 10];
-        for val in &mut samples {
-            *val = adc.read(&mut adc_pin)?;
-            sleep(Duration::from_millis(30));
-        }
-        samples.sort_unstable();
-        let avg: u32 = samples[2..8].iter().map(|&v| v as u32).sum::<u32>() / 6;
-        let corrected = avg as f32 / 0.597; // "simulierte Kalibrierung"
-        let voltage: f32 = corrected * ADC_REF_VOLTAGE / 4095.0;
+    thread::Builder::new()
+        .stack_size(6 * 1024)
+        .spawn(move || {
+            let config = AdcChannelConfig {
+                attenuation: DB_11,
+                ..Default::default()
+            };
+            let adc = AdcDriver::new(adc1).unwrap();
+            let mut adc_pin = AdcChannelDriver::new(&adc, gpio34, &config).unwrap();
 
-        let ph = CALIBRATION + PH_SLOPE * voltage;
+            loop {
+                // 1. ADC-Werte sammeln
+                let mut samples = [0u16; 10];
+                for val in &mut samples {
+                    match adc.read(&mut adc_pin) {
+                        Ok(v) => *val = v,
+                        Err(e) => {
+                            eprintln!("ADC Lesefehler: {:?}", e);
+                            *val = 0;
+                        }
+                    }
+                    sleep(Duration::from_millis(30));
+                }
 
-        if (2.0..=14.0).contains(&ph) {
-            let httpconnection = EspHttpConnection::new(&HttpConfig::default())?;
-            let body =
-                json!({    "ph_value": format!("{:.3}", ph), "sensor_id": env!("ID")}).to_string();
-            let headers = &[
-                ("Content-Type", "application/json"),
-                ("Content-Length", &body.len().to_string()),
-            ];
+                samples.sort_unstable();
+                let avg: u32 = samples[2..8].iter().map(|&v| v as u32).sum::<u32>() / 6;
 
-            let mut httpclient = Client::wrap(httpconnection);
-            let conc = format!("{SERVER}add_ph.php");
-            let mut request = httpclient.post(conc.as_str(), headers)?;
-            request.write_all(body.as_bytes())?;
-            request.submit()?;
-        }
+                // 2. Spannung berechnen
+                let corrected = avg as f32 / 0.597;
+                let voltage: f32 = corrected * ADC_REF_VOLTAGE / 4095.0;
 
-        if let Ok(locked) = settings.lock() {
-            if let Some(val) = &*locked {
-                sleep(Duration::new(val.mess_interval, 0));
-            } else {
-                sleep(Duration::new(30, 0));
+                // 3. pH berechnen
+                let ph = CALIBRATION + PH_SLOPE * voltage;
+                println!("Gemessener pH-Wert: {:.3}", ph);
+
+                // 4. pH-Wert validieren und senden
+                if (2.0..=14.0).contains(&ph) {
+                    if let Ok(httpconnection) = EspHttpConnection::new(&HttpConfig::default()) {
+                        let body = json!({
+                            "ph_value": format!("{:.3}", ph),
+                            "sensor_id": env!("ID")
+                        })
+                        .to_string();
+                        let headers = &[
+                            ("Content-Type", "application/json"),
+                            ("Content-Length", &body.len().to_string()),
+                        ];
+
+                        let mut httpclient = Client::wrap(httpconnection);
+                        if let Ok(mut request) =
+                            httpclient.post(&format!("{SERVER}add_ph.php"), headers)
+                        {
+                            if let Err(e) = request.write_all(body.as_bytes()) {
+                                eprintln!("Fehler beim Schreiben der Anfrage: {:?}", e);
+                            }
+                            if let Err(e) = request.submit() {
+                                eprintln!("Fehler beim Senden der Anfrage: {:?}", e);
+                            }
+                        } else {
+                            eprintln!("Fehler beim Erstellen der HTTP POST-Anfrage");
+                        }
+                    } else {
+                        eprintln!("Fehler beim Aufbau der HTTP-Verbindung");
+                    }
+                } else {
+                    eprintln!("Ungültiger pH-Wert: {:.3}", ph);
+                }
+
+                // 5. Schlafdauer aus Settings lesen
+                let sleep_duration = if let Ok(lock) = settings_clone.lock() {
+                    if let Some(ref settings) = *lock {
+                        Duration::from_secs(settings.mess_interval)
+                    } else {
+                        Duration::from_secs(30)
+                    }
+                } else {
+                    Duration::from_secs(30)
+                };
+
+                thread::sleep(sleep_duration);
             }
-        }
+        })
+        .unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(60));
     }
 }
